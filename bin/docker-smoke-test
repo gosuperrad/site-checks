@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# Build a Bedrock site's production image and verify it against a deliberately
+# unreachable database, without needing real credentials or a live deploy.
+set -euo pipefail
+
+# Find this package's own directory, following the vendor/bin symlink Composer
+# creates. `readlink -f` is GNU-only and macOS is a first-class target here, so
+# walk the links by hand.
+self="${BASH_SOURCE[0]}"
+while [[ -L "$self" ]]; do
+  link="$(readlink "$self")"
+  case "$link" in
+    /*) self="$link" ;;
+    *)  self="$(cd "$(dirname "$self")" && pwd)/$link" ;;
+  esac
+done
+# shellcheck source=../lib/common.sh
+. "$(cd "$(dirname "$self")/.." && pwd)/lib/common.sh"
+
+usage() {
+  cat <<'USAGE'
+Usage: docker-smoke-test [--repo <path>] [tag] [port]
+
+  --repo <path>  Repository to test. Defaults to the git toplevel, then $PWD.
+  tag            Image tag to build (default: smoke-test-<repo basename>).
+  port           Host port to publish (default: a random port in the 18000s).
+USAGE
+}
+
+parse_common_args "$@"
+
+resolve_repo_root "$REPO_ARG"
+cd "$REPO_ROOT" || die "cannot enter $REPO_ROOT"
+
+TAG="${TAG_ARG:-smoke-test-$(basename "$REPO_ROOT")}"
+PORT="${PORT_ARG:-$((18000 + RANDOM % 1000))}"
+CONTAINER_NAME="${TAG}-container"
+
+decide_base_image "$REPO_ROOT" "$TAG"
+
+cleanup() {
+  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  docker rmi "$TAG" >/dev/null 2>&1 || true
+  [[ -z "$BUILT_BASE" ]] || docker rmi "$BUILT_BASE" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+# Printed rather than assumed. The scratch-directory incident that motivated
+# the resolution rules would have been obvious from this one line.
+echo "==> Repository under test: $REPO_ROOT"
+
+if [[ -n "$BUILT_BASE" ]]; then
+  echo "==> Building the runtime base from base/Dockerfile as $BUILT_BASE"
+  docker build -f "$REPO_ROOT/base/Dockerfile" -t "$BUILT_BASE" "$REPO_ROOT"
+fi
+
+echo "==> Building $TAG from $REPO_ROOT${BASE_IMAGE:+ (base: $BASE_IMAGE)}"
+if [[ -n "${BASE_IMAGE:-}" ]]; then
+  docker build --build-arg "BASE_IMAGE=$BASE_IMAGE" -t "$TAG" "$REPO_ROOT"
+else
+  docker build -t "$TAG" "$REPO_ROOT"
+fi
+
+echo "==> Running with a deliberately unreachable DB on port $PORT"
+docker run -d --name "$CONTAINER_NAME" \
+  -e DB_HOST=nonexistent-host \
+  -e DB_NAME=fakedb \
+  -e DB_USER=fakeuser \
+  -e DB_PASSWORD=fakepass \
+  -e WP_HOME=http://localhost \
+  -e WP_SITEURL=http://localhost/wp \
+  -e AUTH_KEY=x -e SECURE_AUTH_KEY=x -e LOGGED_IN_KEY=x -e NONCE_KEY=x \
+  -e AUTH_SALT=x -e SECURE_AUTH_SALT=x -e LOGGED_IN_SALT=x -e NONCE_SALT=x \
+  -p "${PORT}:80" \
+  "$TAG" >/dev/null
+
+sleep 3
+
+pass=true
+
+check() {
+  local label="$1" url="$2" expected="$3"
+  local actual
+  actual="$(curl -s -o /dev/null -w '%{http_code}' "$url")"
+  if [[ "$actual" == "$expected" ]]; then
+    printf '%-14s HTTP %s (expected %s)  PASS\n' "$label" "$actual" "$expected"
+  else
+    printf '%-14s HTTP %s (expected %s)  FAIL\n' "$label" "$actual" "$expected"
+    pass=false
+  fi
+}
+
+check "healthz.php:" "http://localhost:${PORT}/healthz.php" 503
+check "homepage:" "http://localhost:${PORT}/" 500
+
+# Uploads-PHP guard. Test the NESTED path as well as the flat one: WordPress
+# writes every real upload into a dated subdirectory (uploads/2026/09/...),
+# and Caddy's `*` path wildcard only spans a single segment, so a flat-path-only
+# test passes happily against a guard that blocks nothing that matters.
+docker exec "$CONTAINER_NAME" sh -c '
+  mkdir -p /app/web/app/uploads/2026/09
+  printf "<?php echo \"EXECUTED\";" > /app/web/app/uploads/shell.php
+  cp /app/web/app/uploads/shell.php /app/web/app/uploads/2026/09/shell.php
+  cp /app/web/app/uploads/shell.php /app/web/app/uploads/2026/09/shell.phtml
+  cp /app/web/app/uploads/shell.php /app/web/app/uploads/2026/09/shell.PHP
+' >/dev/null
+
+check "uploads php:" "http://localhost:${PORT}/app/uploads/shell.php" 403
+check "uploads nested:" "http://localhost:${PORT}/app/uploads/2026/09/shell.php" 403
+check "uploads phtml:" "http://localhost:${PORT}/app/uploads/2026/09/shell.phtml" 403
+check "uploads pathinfo:" "http://localhost:${PORT}/app/uploads/2026/09/shell.php/x.jpg" 403
+
+# Uppercase extension. Caddy's `path` matcher is case-insensitive but
+# `path_regexp` is not, so before the guard carried (?i) php_server routed
+# shell.PHP to PHP while the guard failed to match it -- a total bypass, and
+# an uppercase extension is a classic upload-filter evasion. This case must
+# be tested on disk (the file really is named .PHP), not just as a URL.
+check "uploads upper:" "http://localhost:${PORT}/app/uploads/2026/09/shell.PHP" 403
+
+# XML-RPC is blocked in Caddy, so it 403s without PHP ever running.
+check "xmlrpc:" "http://localhost:${PORT}/wp/xmlrpc.php" 403
+check "xmlrpc upper:" "http://localhost:${PORT}/wp/XMLRPC.PHP" 403
+
+# Access log. Two assertions, because the two halves break independently and
+# both fail silently: a base-image change that drops the `log` block leaves a
+# container with no request log at all, and a bad log_skip matcher either
+# skips nothing (unbounded disk) or skips everything (no log again). Neither
+# shows up as an error anywhere.
+docker exec "$CONTAINER_NAME" sh -c '
+  mkdir -p /app/web/app/themes
+  printf "body{}" > /app/web/app/themes/smoke-asset.css
+' >/dev/null
+
+# Assert the asset really is served before asserting it is absent from the
+# log. Without this the log_skip check passes just as happily when the request
+# 404s or never reaches Caddy, which proves nothing about log_skip at all.
+check "static asset:" "http://localhost:${PORT}/app/themes/smoke-asset.css" 200
+
+curl -s -o /dev/null "http://localhost:${PORT}/?smoke-access-log=1"
+sleep 1
+container_logs="$(docker logs "$CONTAINER_NAME" 2>&1)"
+
+if grep -qF 'smoke-access-log=1' <<<"$container_logs"; then
+  printf '%-14s dynamic request logged  PASS\n' "access log:"
+else
+  printf '%-14s dynamic request MISSING from access log  FAIL\n' "access log:"
+  pass=false
+fi
+
+if grep -qF 'smoke-asset.css' <<<"$container_logs"; then
+  printf '%-14s static asset was logged, log_skip is not working  FAIL\n' "log_skip:"
+  pass=false
+else
+  printf '%-14s static asset skipped  PASS\n' "log_skip:"
+fi
+
+# Health-check noise. The container health check runs every ~5 seconds forever
+# and was 81% of a live site's access log, so it is skipped -- but only from
+# loopback, so an external probe of /healthz.php stays visible.
+#
+# Both halves are asserted, because a path-only skip (no remote_ip gate) would
+# pass the first check while silently hiding the second. The internal probe's
+# status is checked first: if curl is missing from the image the exec would
+# produce no log line either, and "nothing was logged" would otherwise read as
+# a pass without the probe ever having happened.
+internal_code="$(docker exec "$CONTAINER_NAME" \
+  curl -s -o /dev/null -w '%{http_code}' \
+  'http://localhost/healthz.php?internal-probe=1' 2>/dev/null || echo NOCURL)"
+
+if [[ "$internal_code" == "503" ]]; then
+  printf '%-14s internal probe ran (HTTP %s)  PASS\n' "healthz probe:" "$internal_code"
+else
+  printf '%-14s internal probe did not run (%s) -- skip assertion below is meaningless  FAIL\n' \
+    "healthz probe:" "$internal_code"
+  pass=false
+fi
+
+curl -s -o /dev/null "http://localhost:${PORT}/healthz.php?external-probe=1"
+sleep 1
+container_logs="$(docker logs "$CONTAINER_NAME" 2>&1)"
+
+if grep -qF 'internal-probe=1' <<<"$container_logs"; then
+  printf '%-14s loopback health check WAS logged  FAIL\n' "healthz skip:"
+  pass=false
+else
+  printf '%-14s loopback health check skipped  PASS\n' "healthz skip:"
+fi
+
+if grep -qF 'external-probe=1' <<<"$container_logs"; then
+  printf '%-14s external probe still logged  PASS\n' "healthz ext:"
+else
+  printf '%-14s external probe MISSING from access log  FAIL\n' "healthz ext:"
+  pass=false
+fi
+
+# WP-CLI has to work inside the image: the Coolify cron task and the cutover's
+# search-replace both run through docker exec.
+if docker exec "$CONTAINER_NAME" wp --info >/dev/null 2>&1; then
+  printf '%-14s present  PASS\n' "wp-cli:"
+else
+  printf '%-14s MISSING  FAIL\n' "wp-cli:"
+  pass=false
+fi
+
+# Production php.ini must actually be loaded; the base image ships none.
+ini_check() {
+  local key="$1" expected="$2" actual
+  actual="$(docker exec "$CONTAINER_NAME" php -r "echo ini_get('$key');" 2>/dev/null)"
+  if [[ "$actual" == "$expected" ]]; then
+    printf '%-14s %s=%s  PASS\n' "php.ini:" "$key" "$actual"
+  else
+    printf '%-14s %s=%s (expected %s)  FAIL\n' "php.ini:" "$key" "$actual" "$expected"
+    pass=false
+  fi
+}
+ini_check upload_max_filesize 64M
+ini_check memory_limit 256M
+ini_check display_errors ""
+ini_check opcache.validate_timestamps 0
+
+if [[ "$pass" == true ]]; then
+  echo "==> All checks passed."
+  exit 0
+else
+  echo "==> One or more checks failed. See above."
+  exit 1
+fi

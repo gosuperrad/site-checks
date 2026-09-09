@@ -1,0 +1,17 @@
+{
+  "name": "superrad/site-checks",
+  "description": "The smoke and end-to-end checks for a Super Rad WordPress/Bedrock site image, as one shared definition instead of a copy per repo.",
+  "type": "library",
+  "license": "proprietary",
+  "keywords": ["wordpress", "bedrock", "docker", "testing"],
+  "authors": [
+    {
+      "name": "Super Rad",
+      "homepage": "https://superrad.dev"
+    }
+  ],
+  "bin": [
+    "bin/docker-smoke-test",
+    "bin/docker-e2e-test"
+  ]
+}

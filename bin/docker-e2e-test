@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# Stand the production image up against a real MariaDB container, install
+# WordPress into it, and exercise the things the DB-less smoke test can't
+# reach: WebP image output, WP cron, wp db export, and the live front end.
+#
+# Everything runs on a throwaway Docker network and is torn down on exit.
+set -uo pipefail
+
+# Find this package's own directory, following the vendor/bin symlink Composer
+# creates. `readlink -f` is GNU-only and macOS is a first-class target here, so
+# walk the links by hand.
+self="${BASH_SOURCE[0]}"
+while [[ -L "$self" ]]; do
+  link="$(readlink "$self")"
+  case "$link" in
+    /*) self="$link" ;;
+    *)  self="$(cd "$(dirname "$self")" && pwd)/$link" ;;
+  esac
+done
+# shellcheck source=../lib/common.sh
+. "$(cd "$(dirname "$self")/.." && pwd)/lib/common.sh"
+
+usage() {
+  cat <<'USAGE'
+Usage: docker-e2e-test [--repo <path>] [tag] [port]
+
+  --repo <path>  Repository to test. Defaults to the git toplevel, then $PWD.
+  tag            Image tag to build (default: e2e-<repo basename>).
+  port           Host port to publish (default: a random port in the 19000s).
+USAGE
+}
+
+parse_common_args "$@"
+
+resolve_repo_root "$REPO_ARG"
+cd "$REPO_ROOT" || die "cannot enter $REPO_ROOT"
+
+TAG="${TAG_ARG:-e2e-$(basename "$REPO_ROOT")}"
+PORT="${PORT_ARG:-$((19000 + RANDOM % 1000))}"
+NET="${TAG}-net"; DB="${TAG}-db"; APP="${TAG}-app"
+
+decide_base_image "$REPO_ROOT" "$TAG"
+
+cleanup() {
+  docker rm -f "$APP" "$DB" >/dev/null 2>&1 || true
+  docker network rm "$NET" >/dev/null 2>&1 || true
+  docker rmi "$TAG" >/dev/null 2>&1 || true
+  [[ -z "$BUILT_BASE" ]] || docker rmi "$BUILT_BASE" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+cleanup
+
+pass=true
+fail() { echo "   FAIL: $*"; pass=false; }
+
+# Printed rather than assumed. The scratch-directory incident that motivated
+# the resolution rules would have been obvious from this one line.
+echo "==> Repository under test: $REPO_ROOT"
+
+if [[ -n "$BUILT_BASE" ]]; then
+  echo "==> Building the runtime base from base/Dockerfile as $BUILT_BASE"
+  docker build -f "$REPO_ROOT/base/Dockerfile" -t "$BUILT_BASE" "$REPO_ROOT" >/dev/null \
+    || { echo "BASE BUILD FAILED"; exit 1; }
+fi
+
+echo "==> Building $TAG${BASE_IMAGE:+ (base: $BASE_IMAGE)}"
+if [[ -n "${BASE_IMAGE:-}" ]]; then
+  docker build --build-arg "BASE_IMAGE=$BASE_IMAGE" -t "$TAG" "$REPO_ROOT" >/dev/null \
+    || { echo "BUILD FAILED"; exit 1; }
+else
+  docker build -t "$TAG" "$REPO_ROOT" >/dev/null || { echo "BUILD FAILED"; exit 1; }
+fi
+
+docker network create "$NET" >/dev/null
+echo "==> Starting MariaDB"
+docker run -d --name "$DB" --network "$NET" \
+  -e MARIADB_ROOT_PASSWORD=rootpw -e MARIADB_DATABASE=wp \
+  -e MARIADB_USER=wp -e MARIADB_PASSWORD=wppw mariadb:11.8 >/dev/null
+
+printf '   waiting for db'
+for _ in $(seq 1 60); do
+  docker exec "$DB" mariadb-admin ping -uwp -pwppw --silent >/dev/null 2>&1 && break
+  printf '.'; sleep 2
+done; echo ' up'
+
+echo "==> Starting the app on port $PORT"
+docker run -d --name "$APP" --network "$NET" -p "${PORT}:80" \
+  -e DB_HOST="$DB" -e DB_NAME=wp -e DB_USER=wp -e DB_PASSWORD=wppw \
+  -e WP_ENV=production -e DISABLE_WP_CRON=true \
+  -e WP_HOME="http://localhost:${PORT}" -e WP_SITEURL="http://localhost:${PORT}/wp" \
+  -e AUTH_KEY=a1 -e SECURE_AUTH_KEY=a2 -e LOGGED_IN_KEY=a3 -e NONCE_KEY=a4 \
+  -e AUTH_SALT=a5 -e SECURE_AUTH_SALT=a6 -e LOGGED_IN_SALT=a7 -e NONCE_SALT=a8 \
+  "$TAG" >/dev/null
+sleep 5
+
+echo "==> Installing WordPress"
+docker exec "$APP" wp core install \
+  --url="http://localhost:${PORT}" --title="E2E" \
+  --admin_user=e2eadmin --admin_password='C0rrect!Horse#Battery' \
+  --admin_email=dev@example.com --skip-email >/dev/null 2>&1 \
+  || fail "wp core install"
+
+echo "==> WordPress $(docker exec "$APP" wp core version 2>/dev/null), plugins:"
+docker exec "$APP" wp plugin list --format=csv --fields=name,status,version 2>/dev/null | sed 's/^/   /'
+
+echo "==> Importing a 1600x1200 JPEG"
+docker exec "$APP" php -r '
+$im = new Imagick();
+$im->newPseudoImage(1600, 1200, "plasma:fractal");
+$im->setImageFormat("jpeg");
+$im->setImageCompressionQuality(95);
+$im->writeImage("/tmp/photo.jpg");' 2>/dev/null
+docker exec "$APP" wp media import /tmp/photo.jpg --title="E2E Photo" >/dev/null 2>&1 \
+  || fail "wp media import"
+
+echo "==> Generated media (every sub-size should be .webp)"
+docker exec "$APP" sh -c 'ls -1sh /app/web/app/uploads/*/*/ 2>/dev/null' | sed 's/^/   /'
+
+subsizes="$(docker exec "$APP" wp eval '
+$ids = get_posts(["post_type"=>"attachment","numberposts"=>1,"fields"=>"ids"]);
+$m = wp_get_attachment_metadata((int) $ids[0]);
+$bad = 0;
+foreach ($m["sizes"] as $s) { if ($s["mime-type"] !== "image/webp") { $bad++; } }
+echo $bad;' 2>/dev/null)"
+if [[ "$subsizes" == "0" ]]; then
+  echo "   webp sub-sizes: all converted  PASS"
+else
+  fail "$subsizes sub-size(s) were not converted to WebP"
+fi
+
+echo "==> HTTP checks"
+ck() {
+  local actual; actual="$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:${PORT}$2")"
+  if [[ "$actual" == "$3" ]]; then
+    printf '   %-34s HTTP %s  PASS\n' "$1" "$actual"
+  else
+    printf '   %-34s HTTP %s (expected %s)  FAIL\n' "$1" "$actual" "$3"; pass=false
+  fi
+}
+docker exec "$APP" sh -c 'mkdir -p /app/web/app/uploads/2026/09 && echo "<?php echo 1;" > /app/web/app/uploads/2026/09/x.php'
+ck "homepage"            "/"                              200
+ck "wp-login"            "/wp/wp-login.php"               200
+ck "healthz.php"         "/healthz.php"                   200
+ck "REST api"            "/wp-json/"                      200
+ck "?author=1 blocked"   "/?author=1"                     403
+ck "uploads nested php"  "/app/uploads/2026/09/x.php"     403
+ck "xmlrpc blocked"      "/wp/xmlrpc.php"                 403
+
+echo "==> DISABLED_PLUGINS filter (superrad-mu.php)"
+# The container runs WP_ENV=production, so the plugin should stay active
+# there and be filtered out only when config/environments/local.php loads.
+docker exec "$APP" wp plugin activate cloudflare >/dev/null 2>&1
+prod="$(docker exec "$APP" wp eval \
+  'echo in_array("cloudflare/cloudflare.php", (array) get_option("active_plugins"), true) ? "active" : "filtered";' 2>/dev/null)"
+local_="$(docker exec -e WP_ENV=local "$APP" wp eval \
+  'echo in_array("cloudflare/cloudflare.php", (array) get_option("active_plugins"), true) ? "active" : "filtered";' 2>/dev/null)"
+# 'development' must filter too. It did not until development.php started
+# sharing local.php's definition. .env.example shipped WP_ENV='development'
+# at the time, so that was the environment a default scaffold actually ran in
+# and testing only 'local' passed while the shipped default was broken.
+#
+# It ships 'local' now, which makes this assertion look redundant and is
+# exactly why it is not: a site was still carrying the unfixed development.php
+# on 2026-09-09, invisible because its own copy of this script predated this
+# check. Anyone setting 'development' for its debug output gets the plugins
+# the list is meant to disable, mail senders included.
+dev="$(docker exec -e WP_ENV=development "$APP" wp eval \
+  'echo in_array("cloudflare/cloudflare.php", (array) get_option("active_plugins"), true) ? "active" : "filtered";' 2>/dev/null)"
+if [[ "$prod" == "active" && "$local_" == "filtered" && "$dev" == "filtered" ]]; then
+  echo "   production=active local=filtered development=filtered  PASS"
+else
+  fail "expected production=active local=filtered development=filtered, got production=$prod local=$local_ development=$dev"
+fi
+# The read check above passes whether or not the write side is guarded, which
+# is exactly how this shipped broken. activate_plugin() reads active_plugins
+# through get_option(), so in an environment that disables a plugin it sees
+# the filtered list and writes it straight back, erasing the disabled entries
+# from the database. Promoting that database to production leaves them off
+# for good, because the environment stops filtering but the option no longer
+# lists them.
+#
+# So run a plugin activation in the FILTERED environment and then read the
+# option straight out of the database, bypassing the filter. cloudflare must
+# still be stored.
+# raw_active <what>: reads active_plugins straight out of the database,
+# bypassing the read filter, which is the whole point. "count" returns the
+# number of stored entries; anything else is a plugin basename to look for.
+raw_active() {
+  docker exec "$APP" wp eval "
+    global \$wpdb;
+    \$raw = \$wpdb->get_var( \"SELECT option_value FROM {\$wpdb->options} WHERE option_name = 'active_plugins'\" );
+    \$list = (array) maybe_unserialize( \$raw );
+    echo '$1' === 'count' ? count( \$list ) : ( in_array( '$1', \$list, true ) ? 'stored' : 'absent' );
+  " 2>/dev/null
+}
+
+# Start from a known state so the activation below is guaranteed to be a real
+# write. Deactivating something already inactive is a no-op, so its exit
+# status is deliberately not checked; the activate's is.
+docker exec -e WP_ENV=local "$APP" wp plugin deactivate speculation-rules >/dev/null 2>&1 || true
+
+before_count="$(raw_active count)"
+before_cf="$(raw_active cloudflare/cloudflare.php)"
+[[ "$before_cf" == "stored" ]] \
+  || fail "setup: cloudflare should be stored before the write test (got $before_cf)"
+
+# This script runs without `set -e` and fail() does not abort, so an ignored
+# non-zero exit here would mean no write happened, cloudflare would survive
+# for the wrong reason, and the check below would pass while proving nothing.
+docker exec -e WP_ENV=local "$APP" wp plugin activate speculation-rules >/dev/null 2>&1 \
+  || fail "could not activate speculation-rules under WP_ENV=local; write path not exercised"
+
+after_count="$(raw_active count)"
+after_cf="$(raw_active cloudflare/cloudflare.php)"
+
+# Order matters. Check the disabled entry first, because the broken behaviour
+# writes the filtered list plus one, which leaves the COUNT unchanged and
+# would otherwise be misreported as "no write happened".
+#
+# The count is what proves a write actually landed, and it avoids hardcoding
+# a basename: speculation-rules stores as speculation-rules/load.php, which
+# is not derivable from the slug.
+if [[ "$after_cf" != "stored" ]]; then
+  fail "DISABLED_PLUGINS erased from the database by a plugin activation (cloudflare=$after_cf)"
+elif [[ "$after_count" != "$((before_count + 1))" ]]; then
+  fail "the activation never reached the database (stored entries ${before_count} -> ${after_count}); write path not exercised"
+else
+  echo "   survives a write in the filtered env  PASS"
+fi
+
+docker exec "$APP" wp plugin deactivate cloudflare >/dev/null 2>&1
+
+echo "==> Cron (the Coolify scheduled task command) and wp db export"
+docker exec "$APP" wp cron event run --due-now >/dev/null 2>&1 || fail "wp cron event run"
+docker exec "$APP" sh -c 'wp db export /tmp/dump.sql >/dev/null 2>&1 && test -s /tmp/dump.sql' \
+  || fail "wp db export produced nothing (mariadb-client missing?)"
+
+if [[ "$pass" == true ]]; then
+  echo "==> All checks passed."
+  exit 0
+else
+  echo "==> One or more checks failed. See above."
+  exit 1
+fi

@@ -1,0 +1,57 @@
+name: CI
+
+# These scripts cannot be run here: they build a Bedrock repo's Dockerfile and
+# there is no Bedrock repo in this one. Giving this public repo a token that
+# can read the private site repos would buy that at a price not worth paying,
+# so what runs here is static analysis, and the real acceptance test is the
+# consuming repo's own CI on the lockfile bump. See "Changing a check" in the
+# README for the local path-repository workflow that goes first.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    name: Shell
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Syntax
+        run: |
+          for f in bin/* lib/*.sh tests/*.sh; do
+            bash -n "$f"
+          done
+
+      # bin/* carry no extension, so shellcheck cannot infer the shell from the
+      # filename; the shebang covers that.
+      - name: ShellCheck
+        run: shellcheck --severity=warning bin/* lib/*.sh tests/*.sh
+
+      # The repo-root resolution is the only logic here that can be tested
+      # without Docker and a real Bedrock repo, and it is also the only logic
+      # whose failure mode is a green suite that tested the wrong tree. Ubuntu
+      # runners have bash 5; the scripts also target the bash 3.2 that macOS
+      # still ships, which is what the local run before a tag covers.
+      - name: Repo-root resolution
+        run: ./tests/resolve-repo-root.sh
+
+  composer:
+    name: Composer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          coverage: none
+
+      - run: composer validate --strict --no-check-lock
