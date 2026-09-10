@@ -194,10 +194,26 @@ raw_active() {
   " 2>/dev/null
 }
 
+# The plugin activated below is one this test writes for itself. It used to be
+# speculation-rules, a starter baseline plugin, which quietly required every
+# site to keep shipping it: the first site to remove it (trinity-takeoffs,
+# 2026-09-10) failed here with "write path not exercised", which reads exactly
+# like the bug this test guards against and had nothing to do with it. A probe
+# depends on no site's plugin set, and because the test names it, its stored
+# basename is known and can be checked directly.
+probe=site-checks-probe/site-checks-probe.php
+docker exec -i "$APP" sh -c 'mkdir -p /app/web/app/plugins/site-checks-probe && cat > /app/web/app/plugins/site-checks-probe/site-checks-probe.php' <<'PHP' || fail "setup: could not write the probe plugin; write path not exercised"
+<?php
+/**
+ * Plugin Name: site-checks probe
+ * Description: Written by the superrad/site-checks e2e suite so it has a plugin to activate. Never ships.
+ */
+PHP
+
 # Start from a known state so the activation below is guaranteed to be a real
 # write. Deactivating something already inactive is a no-op, so its exit
 # status is deliberately not checked; the activate's is.
-docker exec -e WP_ENV=local "$APP" wp plugin deactivate speculation-rules >/dev/null 2>&1 || true
+docker exec -e WP_ENV=local "$APP" wp plugin deactivate site-checks-probe >/dev/null 2>&1 || true
 
 before_count="$(raw_active count)"
 before_cf="$(raw_active cloudflare/cloudflare.php)"
@@ -207,28 +223,28 @@ before_cf="$(raw_active cloudflare/cloudflare.php)"
 # This script runs without `set -e` and fail() does not abort, so an ignored
 # non-zero exit here would mean no write happened, cloudflare would survive
 # for the wrong reason, and the check below would pass while proving nothing.
-docker exec -e WP_ENV=local "$APP" wp plugin activate speculation-rules >/dev/null 2>&1 \
-  || fail "could not activate speculation-rules under WP_ENV=local; write path not exercised"
+docker exec -e WP_ENV=local "$APP" wp plugin activate site-checks-probe >/dev/null 2>&1 \
+  || fail "could not activate the probe plugin under WP_ENV=local; write path not exercised"
 
 after_count="$(raw_active count)"
 after_cf="$(raw_active cloudflare/cloudflare.php)"
+after_probe="$(raw_active "$probe")"
 
 # Order matters. Check the disabled entry first, because the broken behaviour
 # writes the filtered list plus one, which leaves the COUNT unchanged and
 # would otherwise be misreported as "no write happened".
 #
-# The count is what proves a write actually landed, and it avoids hardcoding
-# a basename: speculation-rules stores as speculation-rules/load.php, which
-# is not derivable from the slug.
+# The count and the probe's own stored entry together are what prove a write
+# actually landed.
 if [[ "$after_cf" != "stored" ]]; then
   fail "DISABLED_PLUGINS erased from the database by a plugin activation (cloudflare=$after_cf)"
-elif [[ "$after_count" != "$((before_count + 1))" ]]; then
-  fail "the activation never reached the database (stored entries ${before_count} -> ${after_count}); write path not exercised"
+elif [[ "$after_count" != "$((before_count + 1))" || "$after_probe" != "stored" ]]; then
+  fail "the activation never reached the database (stored entries ${before_count} -> ${after_count}, probe=$after_probe); write path not exercised"
 else
   echo "   survives a write in the filtered env  PASS"
 fi
 
-docker exec "$APP" wp plugin deactivate cloudflare >/dev/null 2>&1
+docker exec "$APP" wp plugin deactivate site-checks-probe cloudflare >/dev/null 2>&1
 
 echo "==> Cron (the Coolify scheduled task command) and wp db export"
 docker exec "$APP" wp cron event run --due-now >/dev/null 2>&1 || fail "wp cron event run"
