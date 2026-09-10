@@ -54,6 +54,21 @@ implementation:
 
 Each has a comment saying so. Read it before deleting the line.
 
+## Do not depend on a site's plugin set
+
+These scripts run against every site built from the starter, and sites remove
+starter plugins they have no use for. The `DISABLED_PLUGINS` write test used to
+activate `speculation-rules`; when `trinity-takeoffs` removed it, the test
+failed with "write path not exercised", which reads exactly like the bug it
+guards against. It now writes and activates its own probe plugin. Anything a
+check needs to activate, create in the container.
+
+One assumption is left: both `DISABLED_PLUGINS` tests use `cloudflare` as the
+entry that must be filtered and then preserved, so a site still has to keep
+`cloudflare` installed and listed in `config/environments/local.php`. Lifting
+that means reading the site's own list rather than naming a plugin, which is a
+larger change than the probe was.
+
 ## Adding a check
 
 Add it to the script the check belongs in, never to a second copy elsewhere.
