@@ -146,6 +146,32 @@ ck "?author=1 blocked"   "/?author=1"                     403
 ck "uploads nested php"  "/app/uploads/2026/09/x.php"     403
 ck "xmlrpc blocked"      "/wp/xmlrpc.php"                 403
 
+# The Super Rad login screen's stylesheet has to actually load, not just be
+# linked. wp-login.php answers 200 whether or not its CSS resolves, so the
+# check above passes against an unstyled login page. The URL comes from
+# plugins_url() and therefore from wherever the login module is installed,
+# which moved when the mu-plugins became superrad/wp-mu-plugins
+# (bedrock-coolify#29): a wrong install path or a broken plugins_url() would
+# ship an unstyled login page with every other check green. Raised in review
+# of gosuperrad/trinity-takeoffs#15.
+#
+# The URL is read from the page rather than written here, so this holds for
+# the old loose-file layout and the package layout alike. It is not a site
+# plugin: the login module ships in superrad/wp-mu-plugins, which estate-drift
+# requires of every site.
+login_html="$(curl -s "http://localhost:${PORT}/wp/wp-login.php")"
+login_css="$(grep -o "http://localhost:${PORT}/[^\"']*superrad-custom-login/assets/styles\.css[^\"']*" <<<"$login_html" | head -1)"
+if [[ -z "$login_css" ]]; then
+  fail "wp-login.php links no superrad-custom-login stylesheet"
+else
+  login_css_result="$(curl -s -o /dev/null -w '%{http_code} %{content_type}' "$login_css")"
+  if [[ "$login_css_result" == "200 text/css"* ]]; then
+    printf '   %-34s HTTP %s  PASS\n' "login stylesheet" "${login_css_result%% *}"
+  else
+    printf '   %-34s %s for %s  FAIL\n' "login stylesheet" "$login_css_result" "${login_css#http://localhost:${PORT}}"; pass=false
+  fi
+fi
+
 echo "==> DISABLED_PLUGINS filter (superrad-mu.php)"
 # The container runs WP_ENV=production, so the plugin should stay active
 # there and be filtered out only when config/environments/local.php loads.
