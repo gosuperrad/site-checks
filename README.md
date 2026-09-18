@@ -37,7 +37,8 @@ database. It covers `/healthz.php` reporting DB-unreachable, the homepage
 rendering WordPress's own error page instead of crashing the container, the
 uploads-PHP guard at every path shape a real upload can take (nested, `.phtml`,
 path-info, uppercase `.PHP`), both `xmlrpc` cases, the access log and its
-`log_skip` matcher from both sides, WP-CLI, and the production `php.ini`.
+`log_skip` matcher from both sides, WP-CLI, the `bin/` deploy scripts, and
+the production `php.ini`.
 
 **`docker-e2e-test`** stands the image up against a real MariaDB container and
 installs WordPress, so it can reach what the smoke test cannot: WebP output,

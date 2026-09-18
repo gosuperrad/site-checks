@@ -202,6 +202,39 @@ else
   pass=false
 fi
 
+# Coolify's post-deployment command is `bin/post-deploy.sh`, run from /app.
+# Since bedrock-coolify#45 both bin/ scripts ship in the base image rather than
+# the site repo, so a base that lost them would leave every site's
+# post-deployment command pointing at nothing, and no other check here would
+# notice.
+#
+# Run them rather than `test -x` them: a file that exists but whose interpreter
+# is missing, or that no longer parses, passes `test -x` and fails on deploy.
+# Against this unreachable DB, post-deploy.sh must take its "not installed"
+# early exit (status 0, [post-deploy] prefix), which touches nothing. The
+# bootstrap script is only asked for --help, which exits before any WP-CLI call.
+#
+# `|| rc=$?` rather than reading $? afterwards: this script runs under set -e,
+# so a bare failing assignment would abort the run instead of reporting FAIL.
+# Output is captured before grepping for the same reason pipefail makes
+# `docker exec ... | grep -q` unreliable: grep exiting early can fail the pipe.
+post_deploy_rc=0
+post_deploy_out="$(docker exec -w /app "$CONTAINER_NAME" bin/post-deploy.sh 2>&1)" || post_deploy_rc=$?
+if [[ "$post_deploy_rc" -eq 0 ]] && grep -qF '[post-deploy]' <<<"$post_deploy_out"; then
+  printf '%-14s runs  PASS\n' "post-deploy:"
+else
+  printf '%-14s exit %s: %s  FAIL\n' "post-deploy:" "$post_deploy_rc" "$(tr '\n' ' ' <<<"$post_deploy_out")"
+  pass=false
+fi
+
+bootstrap_out="$(docker exec -w /app "$CONTAINER_NAME" bin/bootstrap-site.sh --help 2>&1)" || true
+if grep -qF 'Usage:' <<<"$bootstrap_out"; then
+  printf '%-14s runs  PASS\n' "bootstrap:"
+else
+  printf '%-14s bin/bootstrap-site.sh --help did not print usage  FAIL\n' "bootstrap:"
+  pass=false
+fi
+
 # Production php.ini must actually be loaded; the base image ships none.
 ini_check() {
   local key="$1" expected="$2" actual
