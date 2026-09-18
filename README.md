@@ -42,6 +42,7 @@ the production `php.ini`.
 
 **`docker-e2e-test`** stands the image up against a real MariaDB container and
 installs WordPress, so it can reach what the smoke test cannot: WebP output,
+the Super Rad login stylesheet actually loading,
 the `DISABLED_PLUGINS` filter on both its read and write paths, WP cron, and
 `wp db export`.
 
