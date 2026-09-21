@@ -77,11 +77,27 @@ docker run -d --name "$DB" --network "$NET" \
   -e MARIADB_ROOT_PASSWORD=rootpw -e MARIADB_DATABASE=wp \
   -e MARIADB_USER=wp -e MARIADB_PASSWORD=wppw mariadb:11.8 >/dev/null
 
+# Not `mariadb-admin ping`. On first start the image's entrypoint runs a
+# temporary server over the socket only, creates the database and user, then
+# stops it and starts the real one. A socket ping answers the temporary server,
+# so it reported "up" one to three seconds before the real server was
+# listening, and `wp core install` could land in the restart. Every check after
+# the install then failed with it. Seen on harvilldesigns on 2026-09-21, with
+# six e2e runs sharing a slow self-hosted runner. `healthcheck.sh --connect`
+# ships in the image and needs a TCP connection, which the temporary server
+# never accepts because it runs with networking off.
 printf '   waiting for db'
+db_up=false
 for _ in $(seq 1 60); do
-  docker exec "$DB" mariadb-admin ping -uwp -pwppw --silent >/dev/null 2>&1 && break
+  if docker exec "$DB" healthcheck.sh --connect --innodb_initialized >/dev/null 2>&1; then
+    db_up=true; break
+  fi
   printf '.'; sleep 2
-done; echo ' up'
+done
+# The loop used to print "up" on a timeout too, which sent a dead database on
+# into a page of failures that each looked like a WordPress bug.
+$db_up || { echo ' timed out'; die "MariaDB did not accept connections within 120s"; }
+echo ' up'
 
 echo "==> Starting the app on port $PORT"
 docker run -d --name "$APP" --network "$NET" -p "${PORT}:80" \
@@ -94,11 +110,16 @@ docker run -d --name "$APP" --network "$NET" -p "${PORT}:80" \
 sleep 5
 
 echo "==> Installing WordPress"
-docker exec "$APP" wp core install \
+# Output is kept and printed on failure. Every later check depends on this one,
+# so a failure here without its reason leaves a log of a dozen downstream
+# failures and nothing that explains them.
+if ! install_out="$(docker exec "$APP" wp core install \
   --url="http://localhost:${PORT}" --title="E2E" \
   --admin_user=e2eadmin --admin_password='C0rrect!Horse#Battery' \
-  --admin_email=dev@example.com --skip-email >/dev/null 2>&1 \
-  || fail "wp core install"
+  --admin_email=dev@example.com --skip-email 2>&1)"; then
+  fail "wp core install"
+  printf '%s\n' "$install_out" | sed 's/^/      /'
+fi
 
 echo "==> WordPress $(docker exec "$APP" wp core version 2>/dev/null), plugins:"
 docker exec "$APP" wp plugin list --format=csv --fields=name,status,version 2>/dev/null | sed 's/^/   /'
