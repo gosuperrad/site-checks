@@ -63,6 +63,27 @@ repo has no `base/` and correctly tests the image it actually deploys.
 Override with `BASE_IMAGE=<image>`, which is how the base publish workflow
 points both suites at a candidate it has already built.
 
+## Vendor Composer credentials
+
+A site that requires ACF Pro or Gravity Forms from their vendors' Composer
+repositories needs credentials in the image build's `composer install`
+(gosuperrad/bedrock-coolify#7). Both scripts hand them to `docker build` as a
+BuildKit secret with id `COMPOSER_AUTH`, which the site's `Dockerfile` mounts
+for that one step. A secret, not a build arg: a build arg is written into the
+image history, where anyone who can pull the image can read the licence key.
+
+They are found in this order, and only the source is printed:
+
+1. `$COMPOSER_AUTH`, the JSON Composer itself reads. CI sets it from the org
+   secret.
+2. `auth.json` in the repository under test.
+3. `~/.ddev/homeadditions/.composer/auth.json`, which also serves
+   `ddev composer` in every project on the machine, so a laptop keeps one copy.
+
+With none of them, the build runs without credentials. That is fine for a site
+with no vendor packages; any other fails in `composer install` with Composer's
+own 401 naming the host.
+
 ## Which repository gets tested
 
 In precedence order: `--repo <path>`, then the git toplevel, then `$PWD`.

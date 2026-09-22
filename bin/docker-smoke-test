@@ -55,10 +55,11 @@ if [[ -n "$BUILT_BASE" ]]; then
 fi
 
 echo "==> Building $TAG from $REPO_ROOT${BASE_IMAGE:+ (base: $BASE_IMAGE)}"
+composer_auth_secret "$REPO_ROOT"
 if [[ -n "${BASE_IMAGE:-}" ]]; then
-  docker build --build-arg "BASE_IMAGE=$BASE_IMAGE" -t "$TAG" "$REPO_ROOT"
+  docker build --build-arg "BASE_IMAGE=$BASE_IMAGE" ${SECRET_ARGS[@]+"${SECRET_ARGS[@]}"} -t "$TAG" "$REPO_ROOT"
 else
-  docker build -t "$TAG" "$REPO_ROOT"
+  docker build ${SECRET_ARGS[@]+"${SECRET_ARGS[@]}"} -t "$TAG" "$REPO_ROOT"
 fi
 
 echo "==> Running with a deliberately unreachable DB on port $PORT"
