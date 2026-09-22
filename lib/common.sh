@@ -128,3 +128,47 @@ decide_base_image() {
     BUILT_BASE="$BASE_IMAGE"
   fi
 }
+
+# Sets SECRET_ARGS to the `docker build` arguments that hand vendor Composer
+# credentials to the site image's `composer install`, or to nothing when none
+# are found. The Dockerfile reads them from a BuildKit secret with id
+# COMPOSER_AUTH (gosuperrad/bedrock-coolify#7), which is also the id Coolify
+# uses for a build-time variable of that name, so CI, a laptop and a deploy
+# all hand over the same thing the same way.
+#
+# A secret rather than a build arg because a build arg is written into the
+# image's history, where anyone who can pull the image can read the licence
+# key. A secret is mounted for one RUN step and is in no layer.
+#
+# Looked for in this order, first hit wins:
+#
+#   1. $COMPOSER_AUTH, which is what CI sets from the org secret.
+#   2. auth.json in the repository under test, Composer's own per-project
+#      location. Gitignored and dockerignored in the starter.
+#   3. ~/.ddev/homeadditions/.composer/auth.json, the one file that also
+#      serves `ddev composer` in every project on this machine, so a laptop
+#      needs the credential in one place rather than seven.
+#
+# Nothing found is not an error: a site with no vendor packages needs none,
+# and a site that does fails in `composer install` with Composer's own 401,
+# which names the host. Only the source is printed, never the value.
+#
+# Bash 3.2: expand with ${SECRET_ARGS[@]+"${SECRET_ARGS[@]}"}, since a bare
+# "${SECRET_ARGS[@]}" on an empty array is an error under set -u there.
+composer_auth_secret() {
+  local root="$1" f
+  SECRET_ARGS=()
+  if [[ -n "${COMPOSER_AUTH:-}" ]]; then
+    SECRET_ARGS=(--secret "id=COMPOSER_AUTH,env=COMPOSER_AUTH")
+    echo "==> Composer credentials: \$COMPOSER_AUTH"
+    return 0
+  fi
+  for f in "$root/auth.json" "$HOME/.ddev/homeadditions/.composer/auth.json"; do
+    if [[ -f "$f" ]]; then
+      SECRET_ARGS=(--secret "id=COMPOSER_AUTH,src=$f")
+      echo "==> Composer credentials: $f"
+      return 0
+    fi
+  done
+  echo "==> Composer credentials: none found (fine unless the site requires a vendor package)"
+}

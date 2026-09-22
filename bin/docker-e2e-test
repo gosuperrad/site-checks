@@ -64,11 +64,12 @@ if [[ -n "$BUILT_BASE" ]]; then
 fi
 
 echo "==> Building $TAG${BASE_IMAGE:+ (base: $BASE_IMAGE)}"
+composer_auth_secret "$REPO_ROOT"
 if [[ -n "${BASE_IMAGE:-}" ]]; then
-  docker build --build-arg "BASE_IMAGE=$BASE_IMAGE" -t "$TAG" "$REPO_ROOT" >/dev/null \
+  docker build --build-arg "BASE_IMAGE=$BASE_IMAGE" ${SECRET_ARGS[@]+"${SECRET_ARGS[@]}"} -t "$TAG" "$REPO_ROOT" >/dev/null \
     || { echo "BUILD FAILED"; exit 1; }
 else
-  docker build -t "$TAG" "$REPO_ROOT" >/dev/null || { echo "BUILD FAILED"; exit 1; }
+  docker build ${SECRET_ARGS[@]+"${SECRET_ARGS[@]}"} -t "$TAG" "$REPO_ROOT" >/dev/null || { echo "BUILD FAILED"; exit 1; }
 fi
 
 docker network create "$NET" >/dev/null
