@@ -172,3 +172,53 @@ composer_auth_secret() {
   done
   echo "==> Composer credentials: none found (fine unless the site requires a vendor package)"
 }
+
+# Wait until <container> answers <url> with any HTTP status, or fail the run.
+#
+# Both scripts used to sleep a fixed few seconds after `docker run` and then
+# assume the server was up. On a loaded runner it was not: on 2026-10-07
+# m3chiro#26's smoke test reached its first curl before Caddy was listening,
+# curl exited 56, and `set -e` ended the run with that code and no FAIL line,
+# on a runner where one image layer had taken 96 seconds to write. A fixed
+# sleep is either too short on a slow machine or wasted on a fast one.
+#
+# Any status counts as ready, including the 503 and 500 the smoke test expects
+# from its unreachable database. This asks "is something listening", never
+# "is it healthy"; the assertions that follow are what judge the answer, and a
+# readiness wait that wanted 200 would hide exactly the failures they report.
+#
+# Fails early if the container stops, since no amount of waiting fixes that,
+# and prints the container's logs either way, because a server that never
+# came up has said why on its stderr and nowhere else.
+#
+# Calls die directly, never from a command substitution, so it ends the run
+# under the e2e script's no-`set -e` as well as under the smoke test's.
+wait_for_http() {
+  local container="$1" url="$2" timeout="${3:-60}"
+  local start="$SECONDS" code running
+
+  printf '   waiting for http'
+  while :; do
+    code="$(curl -s -o /dev/null --max-time 5 -w '%{http_code}' "$url" 2>/dev/null || true)"
+    if [[ -n "$code" && "$code" != "000" ]]; then
+      echo " up after $((SECONDS - start))s (HTTP $code)"
+      return 0
+    fi
+
+    running="$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)"
+    if [[ "$running" != "true" ]]; then
+      echo ' container stopped'
+      docker logs "$container" >&2 2>&1 || true
+      die "$container exited before answering HTTP on $url"
+    fi
+
+    if (( SECONDS - start >= timeout )); then
+      echo ' timed out'
+      docker logs "$container" >&2 2>&1 || true
+      die "$container did not answer HTTP on $url within ${timeout}s"
+    fi
+
+    printf '.'
+    sleep 1
+  done
+}
