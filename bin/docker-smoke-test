@@ -75,14 +75,20 @@ docker run -d --name "$CONTAINER_NAME" \
   -p "${PORT}:80" \
   "$TAG" >/dev/null
 
-sleep 3
+# A readiness wait, not a fixed sleep: see wait_for_http in lib/common.sh.
+wait_for_http "$CONTAINER_NAME" "http://localhost:${PORT}/healthz.php"
 
 pass=true
 
+# `|| true` because this script runs under set -e. curl exits non-zero when
+# nothing answers (7, or 56 for a reset), and a bare assignment would end the
+# run with that code instead of reporting a FAIL line. curl still writes 000
+# through -w in that case, so the endpoint reads as HTTP 000 and fails its
+# assertion like any other wrong status.
 check() {
   local label="$1" url="$2" expected="$3"
   local actual
-  actual="$(curl -s -o /dev/null -w '%{http_code}' "$url")"
+  actual="$(curl -s -o /dev/null -w '%{http_code}' "$url")" || true
   if [[ "$actual" == "$expected" ]]; then
     printf '%-14s HTTP %s (expected %s)  PASS\n' "$label" "$actual" "$expected"
   else
@@ -137,7 +143,9 @@ docker exec "$CONTAINER_NAME" sh -c '
 # 404s or never reaches Caddy, which proves nothing about log_skip at all.
 check "static asset:" "http://localhost:${PORT}/app/themes/smoke-asset.css" 200
 
-curl -s -o /dev/null "http://localhost:${PORT}/?smoke-access-log=1"
+# `|| true` for the reason given at check(): a request that fails is reported
+# by the log assertion below, as a line missing from the access log.
+curl -s -o /dev/null "http://localhost:${PORT}/?smoke-access-log=1" || true
 sleep 1
 container_logs="$(docker logs "$CONTAINER_NAME" 2>&1)"
 
@@ -176,7 +184,7 @@ else
   pass=false
 fi
 
-curl -s -o /dev/null "http://localhost:${PORT}/healthz.php?external-probe=1"
+curl -s -o /dev/null "http://localhost:${PORT}/healthz.php?external-probe=1" || true
 sleep 1
 container_logs="$(docker logs "$CONTAINER_NAME" 2>&1)"
 

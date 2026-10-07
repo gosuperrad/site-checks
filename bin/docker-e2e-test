@@ -108,7 +108,10 @@ docker run -d --name "$APP" --network "$NET" -p "${PORT}:80" \
   -e AUTH_KEY=a1 -e SECURE_AUTH_KEY=a2 -e LOGGED_IN_KEY=a3 -e NONCE_KEY=a4 \
   -e AUTH_SALT=a5 -e SECURE_AUTH_SALT=a6 -e LOGGED_IN_SALT=a7 -e NONCE_SALT=a8 \
   "$TAG" >/dev/null
-sleep 5
+# A readiness wait, not a fixed sleep: see wait_for_http in lib/common.sh.
+# ck() below needs no `|| true` of its own, since this script has no set -e
+# and a curl that reaches nothing already reads as HTTP 000 and fails.
+wait_for_http "$APP" "http://localhost:${PORT}/healthz.php"
 
 echo "==> Installing WordPress"
 # Output is kept and printed on failure. Every later check depends on this one,
