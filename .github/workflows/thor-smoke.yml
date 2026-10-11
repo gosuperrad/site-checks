@@ -1,0 +1,22 @@
+# .github/workflows/thor-smoke.yml
+name: Thor runner smoke test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: thor
+    timeout-minutes: 10
+    steps:
+      - name: Runner info
+        run: |
+          echo "arch: $(uname -m)"
+          echo "host: $(hostname)"
+          echo "cpus: $(nproc)"
+          free -h
+          cat /etc/os-release | head -2
+      - name: Docker should be absent
+        run: |
+          if command -v docker >/dev/null; then docker version; else echo "no docker (expected)"; fi
+      - uses: actions/checkout@v4
