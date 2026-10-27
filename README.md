@@ -36,7 +36,8 @@ GitHub workflow would not: CI and a human at a laptop both run
 database. It covers `/healthz.php` reporting DB-unreachable, the homepage
 rendering WordPress's own error page instead of crashing the container, the
 uploads-PHP guard at every path shape a real upload can take (nested, `.phtml`,
-path-info, uppercase `.PHP`), both `xmlrpc` cases, the access log and its
+path-info, uppercase `.PHP`), both `xmlrpc` cases, the response security headers (including a PHP value
+winning over the base default, and none on `/embed/`), the access log and its
 `log_skip` matcher from both sides, WP-CLI, the `bin/` deploy scripts, and
 the production `php.ini`.
 

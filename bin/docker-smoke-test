@@ -128,6 +128,63 @@ check "uploads upper:" "http://localhost:${PORT}/app/uploads/2026/09/shell.PHP" 
 check "xmlrpc:" "http://localhost:${PORT}/wp/xmlrpc.php" 403
 check "xmlrpc upper:" "http://localhost:${PORT}/wp/XMLRPC.PHP" 403
 
+# Response security headers, set by the base's Caddyfile. Values are read as
+# every line for that header, so a duplicate (the base adding its own next to
+# one PHP already sent) reads as two lines and fails an exact match.
+#
+# `|| true` because grep finds nothing for an absent header, and under
+# pipefail and set -e that would abort the run instead of reporting FAIL.
+header_values() {
+  curl -s -D - -o /dev/null "$1" | tr -d '\r' | grep -i "^$2:" \
+    | sed 's/^[^:]*:[[:space:]]*//' || true
+}
+
+header_check() {
+  local label="$1" url="$2" name="$3" expected="$4" actual
+  actual="$(header_values "$url" "$name")"
+  if [[ "$actual" == "$expected" ]]; then
+    printf '%-14s %s: %s  PASS\n' "$label" "$name" "${actual:-(absent)}"
+  else
+    printf '%-14s %s: %s (expected %s)  FAIL\n' "$label" "$name" \
+      "$(paste -sd '|' - <<<"${actual:-(absent)}")" "${expected:-(absent)}"
+    pass=false
+  fi
+}
+
+check_headers_url="http://localhost:${PORT}/healthz.php"
+header_check "frame opts:" "$check_headers_url" X-Frame-Options SAMEORIGIN
+header_check "referrer:" "$check_headers_url" Referrer-Policy strict-origin-when-cross-origin
+
+# Presence only. The feature list is meant to be tuned in the base, and an
+# exact match here would turn every tuning into a site-checks release.
+if [[ -n "$(header_values "$check_headers_url" Permissions-Policy)" ]]; then
+  printf '%-14s Permissions-Policy present  PASS\n' "permissions:"
+else
+  printf '%-14s Permissions-Policy MISSING  FAIL\n' "permissions:"
+  pass=false
+fi
+
+# The headers are defaults (Caddy's `?`), so a value PHP sends must win and
+# must not gain a duplicate. WordPress relies on this for its own
+# X-Frame-Options on wp-admin, and a site overrides from PHP the same way.
+# Verified 2026-10-27: without `?` this reads "SAMEORIGIN|DENY".
+docker exec "$CONTAINER_NAME" sh -c \
+  'printf "<?php header(\"X-Frame-Options: DENY\");" > /app/web/smoke-xfo.php' >/dev/null
+header_check "frame override:" "http://localhost:${PORT}/smoke-xfo.php" X-Frame-Options DENY
+
+# WordPress's /embed/ URLs exist to be framed by other sites, so the base leaves
+# X-Frame-Options off them. Asserting an absence proves nothing unless the
+# request was answered, so the status is checked first: any real response will
+# do, and WordPress answers 500 here because the DB is unreachable.
+embed_url="http://localhost:${PORT}/sample-post/embed/"
+embed_code="$(curl -s -o /dev/null -w '%{http_code}' "$embed_url")"
+if [[ "$embed_code" == "000" ]]; then
+  printf '%-14s no response from %s  FAIL\n' "frame embed:" "$embed_url"
+  pass=false
+else
+  header_check "frame embed:" "$embed_url" X-Frame-Options ""
+fi
+
 # Access log. Two assertions, because the two halves break independently and
 # both fail silently: a base-image change that drops the `log` block leaves a
 # container with no request log at all, and a bad log_skip matcher either
