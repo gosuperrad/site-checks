@@ -128,6 +128,70 @@ check "uploads upper:" "http://localhost:${PORT}/app/uploads/2026/09/shell.PHP" 
 check "xmlrpc:" "http://localhost:${PORT}/wp/xmlrpc.php" 403
 check "xmlrpc upper:" "http://localhost:${PORT}/wp/XMLRPC.PHP" 403
 
+# Dot segments after a PHP script (GHSA-2x4j-r638-wxff, fixed in FrankenPHP
+# 1.13.5). Caddy matches the cleaned path, so /app/uploads/2026/09/probe.php/
+# ../../../../../missing.php reads as /missing.php and neither guard above
+# matches it. No guard can match a path that cleans to somewhere else, so
+# these assert that the script did not RUN, whatever status came back.
+#
+# Two things stop it, and each pass tests one of them:
+#
+# 1. With web/index.php in place, php_server's try_files rewrites the request
+#    to the cleaned path before PHP sees it. That is how every site runs, and
+#    it is why the estate was never exposed on FrankenPHP 1.13.4.
+# 2. Without a root index.php (or with a custom try_files, or `index off`),
+#    nothing rewrites the path, and FrankenPHP before 1.13.5 split the RAW
+#    path at the first .php and ran probe.php. 1.13.5 resolves the dot
+#    segments first and refuses.
+#
+# The second pass moves index.php aside to reach layer 2 on its own. It is
+# the one that fails on a base older than 1.13.5 (verified 2026-11-05: all
+# three ran on 1.13.4 and returned 404 or 400 on 1.13.5), so do not drop it
+# because the first pass looks like it covers the same URLs.
+#
+# The probe prints a marker its own source does not contain ("EXEC-"."MARKER"),
+# so a response that serves the file as text is not mistaken for one that ran
+# it. xmlrpc.php is planted at the web root, which the xmlrpc guard covers and
+# Bedrock leaves empty, so WordPress core is not touched.
+#
+# --path-as-is: without it curl resolves the dot segments itself and the
+# request never carries them. A 000 fails too: "did not run" proves nothing
+# about a request nobody answered.
+docker exec "$CONTAINER_NAME" sh -c '
+  probe="<?php echo \"EXEC-\" . \"MARKER\";"
+  printf "%s" "$probe" > /app/web/app/uploads/2026/09/probe.php
+  printf "%s" "$probe" > /app/web/xmlrpc.php
+' >/dev/null
+
+check_not_run() {
+  local label="$1" path="$2"
+  local actual body_file
+  body_file="$(mktemp)"
+  actual="$(curl -s --path-as-is -o "$body_file" -w '%{http_code}' "http://localhost:${PORT}${path}")" || true
+  if [[ "$actual" == "000" ]]; then
+    printf '%-14s HTTP %s (no answer)  FAIL\n' "$label" "$actual"
+    pass=false
+  elif grep -q 'EXEC-MARKER' "$body_file"; then
+    printf '%-14s HTTP %s (the PHP ran)  FAIL\n' "$label" "$actual"
+    pass=false
+  else
+    printf '%-14s HTTP %s (did not run)  PASS\n' "$label" "$actual"
+  fi
+  rm -f "$body_file"
+}
+
+dot_segment_probes() {
+  local suffix="$1"
+  check_not_run "uploads dots${suffix}:" "/app/uploads/2026/09/probe.php/../../../../../missing.php"
+  check_not_run "uploads %2F${suffix}:" "/app/uploads/2026/09/probe.php%2F..%2F..%2F..%2F..%2F..%2Fmissing.php"
+  check_not_run "xmlrpc dots${suffix}:" "/xmlrpc.php/../missing.php"
+}
+
+dot_segment_probes ""
+docker exec "$CONTAINER_NAME" mv /app/web/index.php /app/web/index.php.smoke-off
+dot_segment_probes " (no index)"
+docker exec "$CONTAINER_NAME" mv /app/web/index.php.smoke-off /app/web/index.php
+
 # Response security headers, set by the base's Caddyfile. Values are read as
 # every line for that header, so a duplicate (the base adding its own next to
 # one PHP already sent) reads as two lines and fails an exact match.
