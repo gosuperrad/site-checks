@@ -155,8 +155,11 @@ check "xmlrpc upper:" "http://localhost:${PORT}/wp/XMLRPC.PHP" 403
 # Bedrock leaves empty, so WordPress core is not touched.
 #
 # --path-as-is: without it curl resolves the dot segments itself and the
-# request never carries them. A 000 fails too: "did not run" proves nothing
-# about a request nobody answered.
+# request never carries them. Any failed transfer fails too, a 000 or a
+# response cut off after its status line (a PHP crash mid-response, say):
+# "did not run" proves nothing about a body that never fully arrived. The
+# marker is checked first, so a partial body that does carry it still
+# reports that the PHP ran.
 docker exec "$CONTAINER_NAME" sh -c '
   probe="<?php echo \"EXEC-\" . \"MARKER\";"
   printf "%s" "$probe" > /app/web/app/uploads/2026/09/probe.php
@@ -165,14 +168,14 @@ docker exec "$CONTAINER_NAME" sh -c '
 
 check_not_run() {
   local label="$1" path="$2"
-  local actual body_file
+  local actual body_file rc=0
   body_file="$(mktemp)"
-  actual="$(curl -s --path-as-is -o "$body_file" -w '%{http_code}' "http://localhost:${PORT}${path}")" || true
-  if [[ "$actual" == "000" ]]; then
-    printf '%-14s HTTP %s (no answer)  FAIL\n' "$label" "$actual"
-    pass=false
-  elif grep -q 'EXEC-MARKER' "$body_file"; then
+  actual="$(curl -s --path-as-is -o "$body_file" -w '%{http_code}' "http://localhost:${PORT}${path}")" || rc=$?
+  if grep -q 'EXEC-MARKER' "$body_file"; then
     printf '%-14s HTTP %s (the PHP ran)  FAIL\n' "$label" "$actual"
+    pass=false
+  elif [[ "$rc" -ne 0 || "$actual" == "000" ]]; then
+    printf '%-14s HTTP %s (curl exit %s, response incomplete)  FAIL\n' "$label" "$actual" "$rc"
     pass=false
   else
     printf '%-14s HTTP %s (did not run)  PASS\n' "$label" "$actual"
