@@ -53,6 +53,22 @@ cleanup
 pass=true
 fail() { echo "   FAIL: $*"; pass=false; }
 
+# Runs a command quietly and, if it fails, records the failure with the
+# command's own output underneath. `>/dev/null 2>&1 || fail` threw away the one
+# line that explains a failure ("Error establishing a database connection"),
+# and the log then could not tell an unreachable database from a broken image
+# (issue #4). Success stays quiet. Usage: run_or_fail <label> <command...>
+run_or_fail() {
+  local label="$1" out
+  shift
+  if ! out="$("$@" 2>&1)"; then
+    fail "$label"
+    [[ -n "$out" ]] && printf '%s\n' "$out" | sed 's/^/      /'
+    return 1
+  fi
+  return 0
+}
+
 # Printed rather than assumed. The scratch-directory incident that motivated
 # the resolution rules would have been obvious from this one line.
 echo "==> Repository under test: $REPO_ROOT"
@@ -114,16 +130,12 @@ docker run -d --name "$APP" --network "$NET" -p "${PORT}:80" \
 wait_for_http "$APP" "http://localhost:${PORT}/healthz.php"
 
 echo "==> Installing WordPress"
-# Output is kept and printed on failure. Every later check depends on this one,
-# so a failure here without its reason leaves a log of a dozen downstream
-# failures and nothing that explains them.
-if ! install_out="$(docker exec "$APP" wp core install \
+# Every later check depends on this one, so a failure here without its reason
+# leaves a log of a dozen downstream failures and nothing that explains them.
+run_or_fail "wp core install" docker exec "$APP" wp core install \
   --url="http://localhost:${PORT}" --title="E2E" \
   --admin_user=e2eadmin --admin_password='C0rrect!Horse#Battery' \
-  --admin_email=dev@example.com --skip-email 2>&1)"; then
-  fail "wp core install"
-  printf '%s\n' "$install_out" | sed 's/^/      /'
-fi
+  --admin_email=dev@example.com --skip-email
 
 echo "==> WordPress $(docker exec "$APP" wp core version 2>/dev/null), plugins:"
 docker exec "$APP" wp plugin list --format=csv --fields=name,status,version 2>/dev/null | sed 's/^/   /'
@@ -135,8 +147,8 @@ $im->newPseudoImage(1600, 1200, "plasma:fractal");
 $im->setImageFormat("jpeg");
 $im->setImageCompressionQuality(95);
 $im->writeImage("/tmp/photo.jpg");' 2>/dev/null
-docker exec "$APP" wp media import /tmp/photo.jpg --title="E2E Photo" >/dev/null 2>&1 \
-  || fail "wp media import"
+run_or_fail "wp media import" \
+  docker exec "$APP" wp media import /tmp/photo.jpg --title="E2E Photo"
 
 echo "==> Generated media (every sub-size should be .webp)"
 docker exec "$APP" sh -c 'ls -1sh /app/web/app/uploads/*/*/ 2>/dev/null' | sed 's/^/   /'
@@ -274,8 +286,8 @@ before_cf="$(raw_active cloudflare/cloudflare.php)"
 # This script runs without `set -e` and fail() does not abort, so an ignored
 # non-zero exit here would mean no write happened, cloudflare would survive
 # for the wrong reason, and the check below would pass while proving nothing.
-docker exec -e WP_ENV=local "$APP" wp plugin activate site-checks-probe >/dev/null 2>&1 \
-  || fail "could not activate the probe plugin under WP_ENV=local; write path not exercised"
+run_or_fail "could not activate the probe plugin under WP_ENV=local; write path not exercised" \
+  docker exec -e WP_ENV=local "$APP" wp plugin activate site-checks-probe
 
 after_count="$(raw_active count)"
 after_cf="$(raw_active cloudflare/cloudflare.php)"
@@ -298,9 +310,9 @@ fi
 docker exec "$APP" wp plugin deactivate site-checks-probe cloudflare >/dev/null 2>&1
 
 echo "==> Cron (the Coolify scheduled task command) and wp db export"
-docker exec "$APP" wp cron event run --due-now >/dev/null 2>&1 || fail "wp cron event run"
-docker exec "$APP" sh -c 'wp db export /tmp/dump.sql >/dev/null 2>&1 && test -s /tmp/dump.sql' \
-  || fail "wp db export produced nothing (mariadb-client missing?)"
+run_or_fail "wp cron event run" docker exec "$APP" wp cron event run --due-now
+run_or_fail "wp db export produced nothing (mariadb-client missing?)" \
+  docker exec "$APP" sh -c 'wp db export /tmp/dump.sql >/dev/null && test -s /tmp/dump.sql'
 
 if [[ "$pass" == true ]]; then
   echo "==> All checks passed."
